@@ -2,9 +2,9 @@ import os
 import random
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 load_dotenv()
-from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 from pydantic import BaseModel
 
@@ -24,7 +24,7 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 
-# --- DB接続設定 (前回と同じ) ---
+# --- DB接続設定 ---
 def get_db_connection_string():
     db_user = os.environ.get("DB_USER", "root")
     db_pass = os.environ.get("DB_PASSWORD", "")
@@ -32,9 +32,11 @@ def get_db_connection_string():
     instance_connection_name = os.environ.get("INSTANCE_CONNECTION_NAME")
 
     if instance_connection_name:
+        # Cloud Run用
         socket_path = f"/cloudsql/{instance_connection_name}"
         return f"mysql+pymysql://{db_user}:{db_pass}@/{db_name}?unix_socket={socket_path}"
     else:
+        # ローカル開発用
         db_host = os.environ.get("DB_HOST", "127.0.0.1")
         db_port = os.environ.get("DB_PORT", "3306")
         return f"mysql+pymysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
@@ -46,42 +48,40 @@ class ItemRequest(BaseModel):
     name: str
     description: str
 
-# ★追加: 行動ログ記録用
 class InteractionRequest(BaseModel):
     user_id: int
     item_id: int
-    event_type: str = "view"  # view, like, purchase など
+    event_type: str = "view"
 
 # --- APIエンドポイント ---
 
 @app.get("/")
 def read_root():
-    return {"message": "Backend with Recommendation Engine is running!"}
+    return {"message": "Backend with Hybrid Recommendation is running!"}
 
-# ★変更: カテゴリ情報も含めて商品を返す
 @app.get("/items")
 def get_items():
+    """全商品取得（管理画面や一覧用）"""
     try:
         with engine.connect() as connection:
-            # categoryカラムがあれば取得、なければ無視するように書くのが安全だが今回は作成前提
-            result = connection.execute(text("SELECT * FROM items"))
+            result = connection.execute(text("SELECT * FROM items LIMIT 100"))
             items = []
-            for row in result:
+            for r in result:
                 items.append({
-                    "id": row.id,
-                    "name": row.name,
-                    "description": row.description,
-                    "price": row.price,
-                    "category": row.category if hasattr(row, 'category') else "Others", # カテゴリ追加
-                    "image_url": row.image_url
+                    "id": r.id,
+                    "name": r.name,
+                    "description": r.description,
+                    "price": r.price,
+                    "category": r.category if hasattr(r, 'category') else "Others",
+                    "image_url": r.image_url
                 })
             return items
     except Exception as e:
         return {"error": str(e)}
 
-# ★新機能: 行動ログを保存するAPI
 @app.post("/interactions")
 def log_interaction(interaction: InteractionRequest):
+    """ユーザーの行動ログ（クリック/閲覧）を保存"""
     try:
         with engine.connect() as connection:
             connection.execute(
@@ -100,104 +100,98 @@ def log_interaction(interaction: InteractionRequest):
     except Exception as e:
         return {"error": str(e)}
 
-@app.post("/generate-description")
-def generate_description(item: ItemRequest):
-    """Geminiに商品の魅力的な紹介文を作らせる"""
-    if not GOOGLE_API_KEY:
-        return {"comment": "Error: API Key not set."}
-    
-    try:
-        # 高速なモデルを使用
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        
-        prompt = f"""
-        あなたはカリスマ店員です。以下の商品を、お客様が買いたくなるような短いセールストーク（60文字以内）で紹介してください。
-        最後に必ず関連する絵文字を1つ付けてください。
-        
-        商品名: {item.name}
-        特徴: {item.description}
-        """
-        
-        response = model.generate_content(prompt)
-        return {"comment": response.text.strip()}
-        
-    except Exception as e:
-        return {"comment": f"AI Error: {str(e)}"}
-
-# ★新機能: 履歴に基づいたレコメンドAPI (簡易版協調フィルタリング/コンテンツベース)
 @app.get("/recommend/{user_id}")
 def get_recommendations(user_id: int):
+    """
+    【最重要】ハイブリッド推薦API
+    1. 機械学習の予測結果(recommendationsテーブル)があればそれを優先
+    2. なければ行動ログ(interactions)から好みのカテゴリを分析して推薦
+    3. それもなければランダム
+    """
     try:
         with engine.connect() as connection:
-            # 1. ユーザーが最近見たカテゴリを集計する
-            # (MerRecデータが入れば、ここが強力になります)
-            history_result = connection.execute(
+            recommended_items = []
+            reason = "注目の商品です"
+            strategy = "random"
+
+            # 1. 【最優先】ML予測テーブル (recommendations) を確認
+            # 別途Pythonスクリプト(Colab等)で計算してINSERTされたデータを読み込む
+            ml_result = connection.execute(
                 text("""
-                    SELECT i.category, COUNT(*) as count
-                    FROM interactions log
-                    JOIN items i ON log.item_id = i.id
-                    WHERE log.user_id = :user_id
-                    GROUP BY i.category
-                    ORDER BY count DESC
-                    LIMIT 1
+                    SELECT i.*, r.score, r.reason as ml_reason
+                    FROM recommendations r
+                    JOIN items i ON r.item_id = i.id
+                    WHERE r.user_id = :user_id
+                    ORDER BY r.score DESC
+                    LIMIT 10
                 """),
                 {"user_id": user_id}
             )
             
-            top_category = None
-            row = history_result.fetchone()
-            if row:
-                top_category = row[0] # 一番見ているカテゴリ
+            ml_rows = ml_result.fetchall()
+            
+            if ml_rows:
+                # MLの予測データがある場合
+                strategy = "ml_collaborative_filtering"
+                reason = "あなたの行動履歴から、AIが分析しました！"
+                if hasattr(ml_rows[0], 'ml_reason') and ml_rows[0].ml_reason:
+                     reason = ml_rows[0].ml_reason
 
-            # 2. 全商品を取得
-            items_result = connection.execute(text("SELECT * FROM items"))
-            items = []
-            for r in items_result:
-                items.append({
-                    "id": r.id,
-                    "name": r.name,
-                    "description": r.description,
-                    "price": r.price,
-                    "category": r.category if hasattr(r, 'category') else "Others",
-                    "image_url": r.image_url
-                })
-
-            # 3. レコメンドロジック (ルールベースAI)
-            recommended_items = []
-            reason = ""
-
-            if top_category:
-                # ユーザーが好きなカテゴリの商品を優先的に上に持ってくる
-                favorite_items = [i for i in items if i["category"] == top_category]
-                other_items = [i for i in items if i["category"] != top_category]
-                
-                random.shuffle(favorite_items)
-                random.shuffle(other_items)
-                
-                recommended_items = favorite_items + other_items
-                reason = f"最近、{top_category}の商品をよく見ているあなたにおすすめです！"
+                for r in ml_rows:
+                    recommended_items.append({
+                        "id": r.id,
+                        "name": r.name,
+                        "description": r.description,
+                        "price": r.price,
+                        "category": r.category,
+                        "image_url": r.image_url
+                    })
+            
             else:
-                # 履歴がない場合はランダム
-                random.shuffle(items)
-                recommended_items = items
-                reason = "今のトレンド商品です！"
-
-            # 4. Geminiで理由をリライト (オプション)
-            if GOOGLE_API_KEY and top_category:
-                try:
-                    model = genai.GenerativeModel("gemini-1.5-flash")
-                    prompt = f"""
-                    ユーザーは最近「{top_category}」カテゴリの商品に興味を持っています。
-                    おすすめリストの先頭にある「{recommended_items[0]['name']}」を推薦する理由を、
-                    30文字以内で魅力的に生成してください。
-                    """
-                    resp = model.generate_content(prompt)
-                    reason = resp.text.strip()
-                except:
-                    pass
+                # 2. 【次点】ルールベース (行動ログからカテゴリ推薦)
+                history_result = connection.execute(
+                    text("""
+                        SELECT i.category, COUNT(*) as count
+                        FROM interactions log
+                        JOIN items i ON log.item_id = i.id
+                        WHERE log.user_id = :user_id
+                        GROUP BY i.category
+                        ORDER BY count DESC
+                        LIMIT 1
+                    """),
+                    {"user_id": user_id}
+                )
+                
+                top_category_row = history_result.fetchone()
+                
+                if top_category_row:
+                    strategy = "rule_based_category"
+                    top_cat = top_category_row[0]
+                    reason = f"よく見ている {top_cat} カテゴリのおすすめです"
+                    
+                    # そのカテゴリの商品を取得
+                    cat_items_res = connection.execute(
+                        text("SELECT * FROM items WHERE category = :cat ORDER BY RAND() LIMIT 10"),
+                        {"cat": top_cat}
+                    )
+                    for r in cat_items_res:
+                         recommended_items.append({
+                            "id": r.id, "name": r.name, "description": r.description,
+                            "price": r.price, "category": r.category, "image_url": r.image_url
+                        })
+                else:
+                    # 3. 【最終手段】完全ランダム
+                    strategy = "random"
+                    rand_res = connection.execute(text("SELECT * FROM items ORDER BY RAND() LIMIT 10"))
+                    for r in rand_res:
+                         recommended_items.append({
+                            "id": r.id, "name": r.name, "description": r.description,
+                            "price": r.price, "category": r.category, "image_url": r.image_url
+                        })
 
             return {
                 "user_id": user_id,
+                "strategy": strategy,
                 "reason": reason,
                 "items": recommended_items
             }
@@ -205,56 +199,82 @@ def get_recommendations(user_id: int):
     except Exception as e:
         return {"error": str(e)}
 
-# ★DB初期化 (カテゴリ追加対応)
+@app.post("/generate-description")
+def generate_description(item: ItemRequest):
+    """
+    商品クリック時に呼び出されるAI解説生成API
+    """
+    if not GOOGLE_API_KEY:
+        return {"comment": "API Key missing"}
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        
+        # プロンプトエンジニアリング: 
+        # ただの説明ではなく「なぜこのユーザーにおすすめなのか」を捏造気味に熱弁させる
+        prompt = f"""
+        あなたはプロのバイヤーAIです。
+        ユーザーが「{item.name}」という商品に興味を持ってクリックしました。
+        商品の説明: {item.description}
+        
+        この商品がなぜ素晴らしいのか、ユーザーに語りかけるような口調で、
+        30文字〜50文字程度の「ひとこと推薦コメント」を作成してください。
+        最後に絵文字を1つ添えてください。
+        """
+        
+        response = model.generate_content(prompt)
+        return {"comment": response.text.strip()}
+    except Exception as e:
+        return {"comment": f"Error: {str(e)}"}
+
 @app.post("/init-db")
 def init_db():
+    """DB初期化: ML予測結果を入れる箱(recommendations)も作成"""
     try:
         with engine.connect() as connection:
-            # 1. itemsテーブル (category追加)
-            # ※既存テーブルがある場合のエラー回避のため、本来はALTER TABLEですが
-            # ハッカソンなのでDROPして作り直すのが早いです（データ消えますがOK？）
+            # 外部キー制約などが面倒なので、ハッカソンではDROP & CREATEが最強
+            connection.execute(text("DROP TABLE IF EXISTS recommendations"))
+            connection.execute(text("DROP TABLE IF EXISTS interactions"))
             connection.execute(text("DROP TABLE IF EXISTS items"))
+            
+            # 1. Items テーブル (MerRec仕様)
             connection.execute(text("""
                 CREATE TABLE items (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(255) NOT NULL,
+                    id BIGINT PRIMARY KEY,
+                    name VARCHAR(255),
                     description TEXT,
                     price INT,
-                    category VARCHAR(50),
+                    category VARCHAR(100),
+                    brand VARCHAR(100),
+                    item_condition VARCHAR(100),
                     image_url VARCHAR(255)
                 )
             """))
             
-            # 2. interactionsテーブル (履歴用)
+            # 2. Interactions テーブル
             connection.execute(text("""
-                CREATE TABLE IF NOT EXISTS interactions (
+                CREATE TABLE interactions (
                     id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id INT,
-                    item_id INT,
-                    event_type VARCHAR(20),
+                    user_id BIGINT,
+                    item_id BIGINT,
+                    event_type VARCHAR(50),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """))
 
-            # データ投入
-            sample_items = [
-                {"name": "ビンテージ フィルムカメラ", "desc": "1980年代の名機。", "price": 12000, "cat": "Camera"},
-                {"name": "プロ仕様 一眼レフレンズ", "desc": "ポートレートに最適。", "price": 45000, "cat": "Camera"},
-                {"name": "キャンプ用 ランタン", "desc": "雰囲気が出ます。", "price": 4500, "cat": "Outdoor"},
-                {"name": "折りたたみチェア", "desc": "軽量で持ち運び便利。", "price": 3000, "cat": "Outdoor"},
-                {"name": "Python入門書", "desc": "基礎から学べます。", "price": 1500, "cat": "Book"},
-            ]
-            
-            for item in sample_items:
-                connection.execute(
-                    text("INSERT INTO items (name, description, price, category, image_url) VALUES (:name, :desc, :price, :cat, '')"),
-                    {"name": item["name"], "desc": item["desc"], "price": item["price"], "cat": item["cat"]}
+            # 3. Recommendations テーブル (ML予測結果の格納場所)
+            connection.execute(text("""
+                CREATE TABLE recommendations (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT,
+                    item_id BIGINT,
+                    score FLOAT,
+                    reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+            """))
             
             connection.commit()
-            return {"message": "DB initialized with Categories and Interactions table!"}
+            return {"message": "All tables initialized! Ready for MerRec data & ML predictions."}
             
     except Exception as e:
         return {"error": str(e)}
-
-# (その他の関数はそのまま)
