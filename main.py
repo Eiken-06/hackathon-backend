@@ -108,7 +108,7 @@ def generate_description(item: ItemRequest):
     
     try:
         # 高速なモデルを使用
-        model = genai.GenerativeModel("Gemini 2.5 Flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         
         prompt = f"""
         あなたはカリスマ店員です。以下の商品を、お客様が買いたくなるような短いセールストーク（60文字以内）で紹介してください。
