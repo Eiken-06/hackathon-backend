@@ -223,17 +223,14 @@ def generate_description(item: ItemRequest):
     if not GOOGLE_API_KEY:
         return {"comment": "API Key missing"}
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         
         # プロンプト: より魅力的な推薦文を生成させる
         prompt = f"""
         あなたはプロのバイヤーAIです。
         ユーザーが「{item.name}」という商品に興味を持ってクリックしました。
         商品の説明: {item.description}
-        
-        この商品がなぜ素晴らしいのか、ユーザーに語りかけるような口調で、
-        40文字程度の「ひとこと推薦コメント」を作成してください。
-        最後に絵文字を1つ添えてください。
+        この商品について、40文字程度で推薦してください。
         """
         
         response = model.generate_content(prompt)
@@ -293,3 +290,48 @@ def init_db():
             
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/users")
+def get_valid_users():
+    """recommendationsテーブルにデータがあるユーザーIDのリストを返す"""
+    try:
+        with engine.connect() as connection:
+            # データが存在するユニークなユーザーIDを取得
+            result = connection.execute(text("SELECT DISTINCT user_id FROM recommendations ORDER BY user_id"))
+            # 結果をリストに変換 ([row[0], row[0]...])
+            users = [row[0] for row in result]
+            return {"users": users}
+    except Exception as e:
+        return {"error": str(e), "users": []}
+
+@app.post("/purchase")
+def purchase_item(interaction: InteractionRequest):
+    """
+    購入処理API
+    実際には決済処理はせず、DBに「purchase」というイベントログを残し、
+    フロントエンドに「成功」を返すだけ（モック）
+    """
+    try:
+        with engine.connect() as connection:
+            # 購入ログを保存 (event_type="purchase")
+            connection.execute(
+                text("""
+                    INSERT INTO interactions (user_id, item_id, event_type)
+                    VALUES (:user_id, :item_id, 'purchase')
+                """),
+                {
+                    "user_id": interaction.user_id,
+                    "item_id": interaction.item_id
+                }
+            )
+            connection.commit()
+            
+            # ハッカソン用演出: 成功メッセージを返す
+            return {
+                "status": "success", 
+                "message": "Thank you for your purchase!",
+                "receipt_id": f"REC-{random.randint(10000, 99999)}"
+            }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
