@@ -207,7 +207,7 @@ def generate_description(item: ItemRequest):
     if not GOOGLE_API_KEY:
         return {"comment": "API Key missing"}
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         
         # プロンプトエンジニアリング: 
         # ただの説明ではなく「なぜこのユーザーにおすすめなのか」を捏造気味に熱弁させる
