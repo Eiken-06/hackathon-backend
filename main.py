@@ -80,7 +80,7 @@ def generate_description(item: ItemRequest):
         return {"comment": "AI機能は現在オフラインです。（APIキー未設定）"}
     
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash") # 高速で安いモデル
+        model = genai.GenerativeModel("gemini-2.5-flash") # 高速で安いモデル
         
         prompt = f"""
         あなたはプロのフリマアプリのバイヤーです。
