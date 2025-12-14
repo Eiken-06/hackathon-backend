@@ -2,6 +2,8 @@ import os
 import random
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+load_dotenv()
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 from pydantic import BaseModel
