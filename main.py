@@ -2,7 +2,11 @@ import os
 import random
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+load_dotenv()
 from sqlalchemy import create_engine, text
+import google.generativeai as genai  # <-- 追加
+from pydantic import BaseModel      # <-- 追加
 
 app = FastAPI()
 
@@ -36,6 +40,14 @@ engine = create_engine(get_db_connection_string())
 
 # --- APIエンドポイント ---
 
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+
+class ItemRequest(BaseModel):
+    name: str
+    description: str
+
 @app.get("/")
 def read_root():
     return {"message": "Backend is running!"}
@@ -61,58 +73,26 @@ def get_items():
     except Exception as e:
         return {"error": str(e)}
 
-@app.post("/init-db")
-def init_db():
-    """【重要】テーブル作成とテストデータを投入する便利ボタン"""
+@app.post("/generate-description")
+def generate_description(item: ItemRequest):
+    """商品名と説明を受け取り、Geminiに魅力的なセールストークを作らせる"""
+    if not GOOGLE_API_KEY:
+        return {"comment": "AI機能は現在オフラインです。（APIキー未設定）"}
+    
     try:
-        with engine.connect() as connection:
-            # 1. itemsテーブルを作成
-            connection.execute(text("""
-                CREATE TABLE IF NOT EXISTS items (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(255) NOT NULL,
-                    description TEXT,
-                    price INT,
-                    image_url VARCHAR(255)
-                )
-            """))
-            
-            # 2. recommendationsテーブルを作成 (AI用)
-            connection.execute(text("""
-                CREATE TABLE IF NOT EXISTS recommendations (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id INT,
-                    item_id INT,
-                    reason TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """))
-
-            # 3. データが空ならテストデータを投入
-            result = connection.execute(text("SELECT COUNT(*) FROM items"))
-            count = result.fetchone()[0]
-            
-            if count == 0:
-                # サンプルデータ (MerRecのふりをしたデータ)
-                sample_items = [
-                    {"name": "ビンテージ フィルムカメラ", "desc": "1980年代の名機。動作確認済み。", "price": 12000},
-                    {"name": "キャンプ用 ランタン", "desc": "LEDですが暖色系の光で雰囲気が出ます。", "price": 4500},
-                    {"name": "プログラミング入門書", "desc": "Pythonの基礎から学べます。少し書き込みあり。", "price": 1500},
-                    {"name": "ワイヤレスイヤホン", "desc": "ノイズキャンセリング機能付き。", "price": 8000},
-                    {"name": "手作り レザートートバッグ", "desc": "本革を使用したハンドメイド品です。", "price": 25000},
-                ]
-                
-                for item in sample_items:
-                    # プレースホルダーを使って安全に挿入
-                    connection.execute(
-                        text("INSERT INTO items (name, description, price, image_url) VALUES (:name, :desc, :price, '')"),
-                        {"name": item["name"], "desc": item["desc"], "price": item["price"]}
-                    )
-                
-                connection.commit()
-                return {"message": "Tables created and sample data inserted!"}
-            else:
-                return {"message": "Tables already exist. Skipped data insertion."}
-                
+        model = genai.GenerativeModel("gemini-1.5-flash") # 高速で安いモデル
+        
+        prompt = f"""
+        あなたはプロのフリマアプリのバイヤーです。
+        以下の商品を、買いたくなるような短いセールストーク（50文字以内）で紹介してください。
+        絵文字を1つ使って、親しみやすくしてください。
+        
+        商品名: {item.name}
+        元の説明: {item.description}
+        """
+        
+        response = model.generate_content(prompt)
+        return {"comment": response.text.strip()}
+        
     except Exception as e:
-        return {"error": str(e)}
+        return {"comment": f"AI生成エラー: {str(e)}"}

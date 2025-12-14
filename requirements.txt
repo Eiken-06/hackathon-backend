@@ -4,3 +4,4 @@ sqlalchemy
 pymysql
 python-dotenv
 cryptography
+google-generativeai
