@@ -100,6 +100,30 @@ def log_interaction(interaction: InteractionRequest):
     except Exception as e:
         return {"error": str(e)}
 
+@app.post("/generate-description")
+def generate_description(item: ItemRequest):
+    """Geminiに商品の魅力的な紹介文を作らせる"""
+    if not GOOGLE_API_KEY:
+        return {"comment": "Error: API Key not set."}
+    
+    try:
+        # 高速なモデルを使用
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        
+        prompt = f"""
+        あなたはカリスマ店員です。以下の商品を、お客様が買いたくなるような短いセールストーク（60文字以内）で紹介してください。
+        最後に必ず関連する絵文字を1つ付けてください。
+        
+        商品名: {item.name}
+        特徴: {item.description}
+        """
+        
+        response = model.generate_content(prompt)
+        return {"comment": response.text.strip()}
+        
+    except Exception as e:
+        return {"comment": f"AI Error: {str(e)}"}
+
 # ★新機能: 履歴に基づいたレコメンドAPI (簡易版協調フィルタリング/コンテンツベース)
 @app.get("/recommend/{user_id}")
 def get_recommendations(user_id: int):
