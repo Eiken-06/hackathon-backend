@@ -13,7 +13,7 @@ app = FastAPI()
 # --- CORS設定 ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # 本番環境では特定のドメインに絞るべきですが、ハッカソンでは全許可でOK
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,16 +32,22 @@ def get_db_connection_string():
     instance_connection_name = os.environ.get("INSTANCE_CONNECTION_NAME")
 
     if instance_connection_name:
-        # Cloud Run用
+        # Cloud Run用 (Unix Socket接続)
         socket_path = f"/cloudsql/{instance_connection_name}"
         return f"mysql+pymysql://{db_user}:{db_pass}@/{db_name}?unix_socket={socket_path}"
     else:
-        # ローカル開発用
+        # ローカル開発用 (TCP接続)
         db_host = os.environ.get("DB_HOST", "127.0.0.1")
         db_port = os.environ.get("DB_PORT", "3306")
         return f"mysql+pymysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
 
-engine = create_engine(get_db_connection_string())
+try:
+    engine = create_engine(get_db_connection_string())
+    # 接続確認
+    with engine.connect() as conn:
+        print("Successfully connected to the database.")
+except Exception as e:
+    print(f"Database connection error: {e}")
 
 # --- リクエスト型定義 ---
 class ItemRequest(BaseModel):
@@ -73,7 +79,8 @@ def get_items():
                     "description": r.description,
                     "price": r.price,
                     "category": r.category if hasattr(r, 'category') else "Others",
-                    "image_url": r.image_url
+                    "image_url": r.image_url,
+                    "score": 0.0 # デフォルトスコア
                 })
             return items
     except Exception as e:
@@ -115,7 +122,7 @@ def get_recommendations(user_id: int):
             strategy = "random"
 
             # 1. 【最優先】ML予測テーブル (recommendations) を確認
-            # 別途Pythonスクリプト(Colab等)で計算してINSERTされたデータを読み込む
+            # recommendationsテーブルには score カラムがある前提
             ml_result = connection.execute(
                 text("""
                     SELECT i.*, r.score, r.reason as ml_reason
@@ -134,8 +141,14 @@ def get_recommendations(user_id: int):
                 # MLの予測データがある場合
                 strategy = "ml_collaborative_filtering"
                 reason = "あなたの行動履歴から、AIが分析しました！"
-                if hasattr(ml_rows[0], 'ml_reason') and ml_rows[0].ml_reason:
-                     reason = ml_rows[0].ml_reason
+                
+                # DBから取得した行の中に 'ml_reason' があればそれを使う
+                # (SQLAlchemyのバージョンによっては row.ml_reason でアクセス、辞書型なら row['ml_reason'])
+                first_row = ml_rows[0]
+                # 安全に属性アクセスを試みる
+                ml_reason_val = getattr(first_row, 'ml_reason', None)
+                if ml_reason_val:
+                     reason = ml_reason_val
 
                 for r in ml_rows:
                     recommended_items.append({
@@ -144,7 +157,8 @@ def get_recommendations(user_id: int):
                         "description": r.description,
                         "price": r.price,
                         "category": r.category,
-                        "image_url": r.image_url
+                        "image_url": r.image_url,
+                        "score": getattr(r, 'score', 0.95) # スコアがあれば入れる
                     })
             
             else:
@@ -177,7 +191,8 @@ def get_recommendations(user_id: int):
                     for r in cat_items_res:
                          recommended_items.append({
                             "id": r.id, "name": r.name, "description": r.description,
-                            "price": r.price, "category": r.category, "image_url": r.image_url
+                            "price": r.price, "category": r.category, "image_url": r.image_url,
+                            "score": 0.8 # カテゴリ推薦は一律0.8くらいにしておく
                         })
                 else:
                     # 3. 【最終手段】完全ランダム
@@ -186,7 +201,8 @@ def get_recommendations(user_id: int):
                     for r in rand_res:
                          recommended_items.append({
                             "id": r.id, "name": r.name, "description": r.description,
-                            "price": r.price, "category": r.category, "image_url": r.image_url
+                            "price": r.price, "category": r.category, "image_url": r.image_url,
+                            "score": 0.0 # ランダムはスコアなし
                         })
 
             return {
@@ -207,17 +223,16 @@ def generate_description(item: ItemRequest):
     if not GOOGLE_API_KEY:
         return {"comment": "API Key missing"}
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         
-        # プロンプトエンジニアリング: 
-        # ただの説明ではなく「なぜこのユーザーにおすすめなのか」を捏造気味に熱弁させる
+        # プロンプト: より魅力的な推薦文を生成させる
         prompt = f"""
         あなたはプロのバイヤーAIです。
         ユーザーが「{item.name}」という商品に興味を持ってクリックしました。
         商品の説明: {item.description}
         
         この商品がなぜ素晴らしいのか、ユーザーに語りかけるような口調で、
-        30文字〜50文字程度の「ひとこと推薦コメント」を作成してください。
+        40文字程度の「ひとこと推薦コメント」を作成してください。
         最後に絵文字を1つ添えてください。
         """
         
