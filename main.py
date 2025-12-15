@@ -13,7 +13,7 @@ app = FastAPI()
 # --- CORS設定 ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # 本番環境では特定のドメインに絞るべきですが、ハッカソンでは全許可でOK
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -227,7 +227,7 @@ def generate_description(item: ItemRequest):
         
         # プロンプト: より魅力的な推薦文を生成させる
         prompt = f"""
-        あなたはプロのバイヤーAIです。
+        あなたはプロのバイヤーです。
         ユーザーが「{item.name}」という商品に興味を持ってクリックしました。
         商品の説明: {item.description}
         この商品について、40文字程度で推薦してください。
@@ -310,7 +310,7 @@ def purchase_item(interaction: InteractionRequest):
     """
     購入処理API
     実際には決済処理はせず、DBに「purchase」というイベントログを残し、
-    フロントエンドに「成功」を返すだけ（モック）
+    フロントエンドに「成功」を返すだけ
     """
     try:
         with engine.connect() as connection:
@@ -327,11 +327,62 @@ def purchase_item(interaction: InteractionRequest):
             )
             connection.commit()
             
-            # ハッカソン用演出: 成功メッセージを返す
             return {
                 "status": "success", 
-                "message": "Thank you for your purchase!",
+                "message": "ご購入ありがとうございます！",
                 "receipt_id": f"REC-{random.randint(10000, 99999)}"
             }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# --- main.py 末尾に追加 ---
+
+# 1. ユーザー登録API (簡易版)
+@app.post("/register")
+def register_user():
+    """新規ユーザーを作成してIDを返す"""
+    try:
+        with engine.connect() as connection:
+            # 新しいIDを生成（現在の最大ID + 1）
+            # ※本来はAUTO_INCREMENTですが、recommendationsなどとの整合性のため簡易採番
+            result = connection.execute(text("SELECT MAX(user_id) FROM interactions"))
+            max_id = result.scalar() or 10000
+            new_user_id = int(max_id) + 1
+            
+            # 登録ログを残しておく（これで有効なユーザーとして認識させる）
+            connection.execute(
+                text("INSERT INTO interactions (user_id, item_id, event_type) VALUES (:uid, 0, 'register')"),
+                {"uid": new_user_id}
+            )
+            connection.commit()
+            return {"user_id": new_user_id, "message": "登録完了！"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# 2. 商品出品API
+@app.post("/items")
+def create_item(item: ItemRequest):
+    """商品を新規出品する"""
+    try:
+        with engine.connect() as connection:
+            # ランダムなIDを生成
+            new_id = random.randint(100000, 999999)
+            # 画像はデモ用プレースホルダー
+            
+            connection.execute(
+                text("""
+                    INSERT INTO items (id, name, description, price, category, image_url)
+                    VALUES (:id, :name, :desc, :price, 'New Arrival', '')
+                """),
+                {
+                    "id": new_id,
+                    "name": item.name,
+                    "desc": item.description,
+                    "price": random.randint(500, 5000) # 価格はデモ用にランダム、本来はリクエストから取る
+                }
+            )
+            connection.commit()
+            return {"status": "success", "message": "出品しました！"}
+    except Exception as e:
+        return {"error": str(e)}
